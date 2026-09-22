@@ -4,7 +4,12 @@ import { db } from '@/db'
 import { uid } from '@/utils/format'
 import { ensureVersions } from '@/utils/version'
 import { REVIEW, PUBLISH, buildTimelineEntry } from '@/utils/review'
-import { FRESH, calcDueAt, isFreshnessEnabled, isFreshTicketOpen, canManageFreshness, buildFreshTimelineEntry } from '@/utils/freshness'
+import {
+  FRESH, FRESH_SOURCE, calcDueAt, isFreshnessEnabled, isFreshTicketOpen,
+  canManageFreshness, canManageCategoryFreshPolicy, resolveFreshPolicy, planCategoryFreshness,
+  categoryPolicy, ticketRuleChanged,
+  buildFreshTimelineEntry
+} from '@/utils/freshness'
 import { GUEST_ID, isGuestUser, ROLE } from '@/utils/permission'
 import { canSubmitReview } from '@/utils/review'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
@@ -141,12 +146,15 @@ export const useFreshnessStore = defineStore('freshness', () => {
         if (pendingContentReview) continue
 
         const round = (fresh.freshness.round || 0) + 1
+        // 规则快照：建单时固化周期与来源，分类策略/文档覆盖在本轮复核期间调整不影响在途单节奏
         const ticket = {
           id: uid('fr'),
           docId: fresh.id,
           round,
           status: FRESH.OPEN,
           cycleDays: Number(fresh.freshness.cycleDays),
+          cycleSource: fresh.freshness.source || FRESH_SOURCE.DOC,
+          categoryId: fresh.categoryId || null,
           dueAt: fresh.freshness.nextDueAt, // 本轮到期点（逾期时长据此展示）
           reviewId: null,
           submittedBy: null,
@@ -165,55 +173,221 @@ export const useFreshnessStore = defineStore('freshness', () => {
     await Promise.all([reload(), kb.reloadDocs()])
   }
 
-  // 负责人设置/调整复核周期。
-  // - 首次启用：记录周期，nextDueAt 自当前起算；
-  // - 调整周期（无流转复核单）：以当前时刻为基准重算到期点，保留历史轮次；
-  // - 存在流转中复核单时不允许直接改周期，需先完成/作废本轮，避免周期与复核单脱节。
-  // 返回 { status: 'ok' } | 'denied' | 'guest' | 'missing' | 'has-open' | 'bad-cycle'
+  // 解析文档当前生效策略（文档覆盖优先，其次继承所属分类）
+  function policyOf(doc) {
+    return resolveFreshPolicy(doc, (catId) => useKbStore().catMap[catId] || null)
+  }
+
+  // 负责人设置/调整文档单独复核周期（文档覆盖，source='doc'）。
+  // - 无流转复核单：立即生效，nextDueAt 自当前起算，保留历史轮次；
+  // - 存在流转中复核单：允许提前调整（覆盖配置先落库，作为下一轮规则快照），但本轮在途单
+  //   仍按建单时的规则执行；审批通过时按最新生效配置重算到期点，并在复核单上留痕提示。
+  // 文档单独覆盖不随所属分类策略的后续调整变化。
+  // 返回 { status: 'ok' } | 'denied' | 'guest' | 'missing' | 'deferred' | 'bad-cycle'
   async function setFreshCycle(docId, cycleDays, currentUser) {
     const kb = useKbStore()
     await kb.loadAll()
     const userId = currentUser?.id || GUEST_ID
     const role = currentUser?.role || null
     const days = Number(cycleDays)
-    let result = { status: 'error' }
     if (!(days > 0)) return { status: 'bad-cycle' }
+    let result = { status: 'error' }
 
     await db.transaction('rw', db.docs, db.freshnessTickets, async () => {
       const doc = await db.docs.get(docId)
       if (!doc) { result = { status: 'missing' }; return }
       if (isGuestUser(userId)) { result = { status: 'guest' }; return }
       if (!canManageFreshness(doc, userId, role)) { result = { status: 'denied' }; return }
-      const openT = await db.freshnessTickets
-        .where('docId').equals(docId)
-        .filter((t) => isFreshTicketOpen(t)).first()
-      if (openT) { result = { status: 'has-open', ticket: openT }; return }
 
       const nowIso0 = new Date().toISOString()
       const existed = isFreshnessEnabled(doc)
+      const wasCategory = doc.freshness?.source === FRESH_SOURCE.CATEGORY
       const prevRound = doc.freshness?.round || 0
+      const prevApproved = doc.freshness?.lastApprovedAt || null
+      const openT = await db.freshnessTickets
+        .where('docId').equals(docId)
+        .filter((t) => isFreshTicketOpen(t)).first()
+
+      if (openT) {
+        // 在途复核单：覆盖配置仅作为「下一轮规则」落库，不改本轮到期点、不动 activeTicket；
+        // 问答引用仍暂停，本轮审批通过时 syncFreshTicket 按新配置重算周期
+        await db.docs.update(docId, {
+          freshness: {
+            cycleDays: days,
+            source: FRESH_SOURCE.DOC,
+            nextDueAt: doc.freshness?.nextDueAt || openT.dueAt,
+            round: prevRound,
+            activeTicket: openT.id,
+            ...(prevApproved ? { lastApprovedAt: doc.freshness.lastApprovedAt, lastApprovedBy: doc.freshness.lastApprovedBy, lastReviewId: doc.freshness.lastReviewId } : {}),
+            overrideUpdatedAt: nowIso0
+          }
+        })
+        const label = (wasCategory ? '文档单独覆盖分类策略，复核周期改为 ' + days + ' 天' : '调整复核周期为 ' + days + ' 天') + '（本轮复核进行中，通过后下一轮生效）'
+        await db.freshnessTickets.update(openT.id, {
+          timeline: [...(openT.timeline || []), buildFreshTimelineEntry('doc-override', userId, label, nowIso0)]
+        })
+        result = { status: 'deferred', action: wasCategory ? 'override' : 'change' }
+        return
+      }
+
       const patch = {
         cycleDays: days,
+        source: FRESH_SOURCE.DOC,
         nextDueAt: calcDueAt(days, nowIso0),
         round: prevRound,
         activeTicket: null,
-        updatedAt: nowIso0
+        overrideUpdatedAt: nowIso0
       }
       await db.docs.update(docId, { freshness: patch })
-      // 设置/调整动作留痕到最近一轮复核单（无历史单时仅写配置，不凭空建单）
+      // 设置/调整动作留痕到最近一轮终态复核单（无历史单时仅写配置，不凭空建单）
       const lastTicket = await db.freshnessTickets
         .where('docId').equals(docId)
         .filter((t) => t.status === FRESH.APPROVED || t.status === FRESH.CANCELLED).first()
       if (lastTicket) {
-        const label = existed ? '调整复核周期为 ' + days + ' 天' : '开启知识保鲜，复核周期 ' + days + ' 天'
+        const label = wasCategory
+          ? '文档单独覆盖分类策略，复核周期 ' + days + ' 天'
+          : existed ? '调整复核周期为 ' + days + ' 天' : '开启知识保鲜，复核周期 ' + days + ' 天'
         await db.freshnessTickets.update(lastTicket.id, {
-          timeline: [...(lastTicket.timeline || []), buildFreshTimelineEntry(existed ? 'change' : 'setting', userId, label, nowIso0)]
+          timeline: [...(lastTicket.timeline || []), buildFreshTimelineEntry(wasCategory ? 'doc-override' : (existed ? 'change' : 'setting'), userId, label, nowIso0)]
         })
       }
-      result = { status: 'ok', action: existed ? 'change' : 'setting' }
+      result = { status: 'ok', action: wasCategory ? 'override' : (existed ? 'change' : 'setting') }
     })
 
     await Promise.all([reload(), useKbStore().reloadDocs()])
+    return result
+  }
+
+  // 取消文档单独覆盖，恢复跟随所属分类策略（仅文档负责人/管理员）。
+  // 无在途单时按分类策略立即重算（分类无策略则关闭保鲜）；有在途单时下一轮生效。
+  // 返回 { status: 'ok' } | 'denied' | 'guest' | 'missing' | 'no-override'
+  async function resetDocFreshCycle(docId, currentUser) {
+    const kb = useKbStore()
+    await kb.loadAll()
+    const userId = currentUser?.id || GUEST_ID
+    const role = currentUser?.role || null
+    let result = { status: 'error' }
+
+    await db.transaction('rw', db.docs, db.freshnessTickets, async () => {
+      const doc = await db.docs.get(docId)
+      if (!doc) { result = { status: 'missing' }; return }
+      if (isGuestUser(userId)) { result = { status: 'guest' }; return }
+      if (!canManageFreshness(doc, userId, role)) { result = { status: 'denied' }; return }
+      const isOverride = doc.freshness?.source === FRESH_SOURCE.DOC || (doc.freshness && !doc.freshness.source)
+      if (!isOverride) { result = { status: 'no-override' }; return }
+
+      const nowIso0 = new Date().toISOString()
+      const policy = categoryPolicy(kb.catMap[doc.categoryId])
+      const openT = await db.freshnessTickets
+        .where('docId').equals(docId)
+        .filter((t) => isFreshTicketOpen(t)).first()
+
+      if (openT) {
+        // 本轮仍按在途单规则执行；记录下一轮将回到分类策略（或关闭）
+        const label = policy
+          ? '取消文档单独覆盖，复核周期恢复跟随分类策略（' + policy.cycleDays + ' 天），本轮通过后下一轮生效'
+          : '取消文档单独覆盖（分类未设置策略），本轮通过后关闭知识保鲜'
+        await db.freshnessTickets.update(openT.id, {
+          timeline: [...(openT.timeline || []), buildFreshTimelineEntry('doc-reset-category', userId, label, nowIso0)]
+        })
+        // 删除文档侧覆盖：审批通过时按「无生效策略」关闭；审批前的引用状态仍由在途单决定
+        await db.docs.update(docId, { freshness: null })
+        result = { status: 'deferred' }
+        return
+      }
+
+      if (!policy) {
+        await db.docs.update(docId, { freshness: null })
+      } else {
+        await db.docs.update(docId, {
+          freshness: {
+            cycleDays: policy.cycleDays,
+            source: FRESH_SOURCE.CATEGORY,
+            nextDueAt: calcDueAt(policy.cycleDays, nowIso0),
+            round: doc.freshness?.round || 0,
+            activeTicket: null,
+            policyUpdatedAt: nowIso0
+          }
+        })
+      }
+      const lastTicket = await db.freshnessTickets
+        .where('docId').equals(docId)
+        .filter((t) => t.status === FRESH.APPROVED || t.status === FRESH.CANCELLED).first()
+      if (lastTicket) {
+        await db.freshnessTickets.update(lastTicket.id, {
+          timeline: [...(lastTicket.timeline || []), buildFreshTimelineEntry('doc-reset-category', userId, policy ? '取消覆盖，恢复跟随分类策略（' + policy.cycleDays + ' 天）' : '取消覆盖，分类未设置策略，关闭知识保鲜', nowIso0)]
+        })
+      }
+      result = { status: 'ok', cycleDays: policy?.cycleDays || null }
+    })
+
+    await Promise.all([reload(), kb.reloadDocs()])
+    return result
+  }
+
+  // 管理员按分类批量设置复核周期（分类策略）。
+  // 同事务内：① 更新分类 freshPolicy；② 对该分类下全部文档逐篇重算生效配置
+  // （planCategoryFreshness：文档单独覆盖跳过；在途复核单跳过、保留规则快照；其余即时重算到期点）。
+  // cycleDays 传 null/0 表示关闭该分类策略（仅清除跟随型配置，文档覆盖保留）。
+  // 返回 { status: 'ok', affected, skipped } | 'denied' | 'guest' | 'missing' | 'bad-cycle'
+  async function setCategoryFreshPolicy(categoryId, cycleDays, currentUser) {
+    const kb = useKbStore()
+    await kb.loadAll()
+    const userId = currentUser?.id || GUEST_ID
+    const role = currentUser?.role || null
+    let result = { status: 'error' }
+    const days = cycleDays == null || cycleDays === '' ? null : Number(cycleDays)
+    if (days !== null && !(days > 0)) return { status: 'bad-cycle' }
+    if (!canManageCategoryFreshPolicy(role, userId)) return { status: 'denied' }
+
+    await db.transaction('rw', db.categories, db.docs, db.freshnessTickets, async () => {
+      const category = await db.categories.get(categoryId)
+      if (!category) { result = { status: 'missing' }; return }
+      const nowIso0 = new Date().toISOString()
+      const policy = days ? { cycleDays: days, updatedAt: nowIso0, updatedBy: userId } : null
+      await db.categories.update(categoryId, { freshPolicy: policy })
+
+      const docs = await db.docs.where('categoryId').equals(categoryId).toArray()
+      let affected = 0
+      let enabled = 0
+      let recalced = 0
+      let disabled = 0
+      const skipped = { override: 0, open: 0, unchanged: 0 }
+      for (const doc of docs) {
+        const openT = await db.freshnessTickets
+          .where('docId').equals(doc.id)
+          .filter((t) => isFreshTicketOpen(t)).first()
+        const plan = planCategoryFreshness(doc, policy, nowIso0, !!openT)
+        if (plan.action === 'skip') {
+          if (plan.reason === 'doc-override') skipped.override++
+          else if (plan.reason === 'open-ticket') {
+            skipped.open++
+            // 在途单保留旧规则快照：仅留痕提示，本轮节奏不变，通过后按新策略重算
+            const current = policy ? { cycleDays: days, source: FRESH_SOURCE.CATEGORY } : null
+            if (ticketRuleChanged(openT, current)) {
+              const label = current
+                ? '所属分类复核周期调整为 ' + days + ' 天；本轮复核仍按建单时的 ' + openT.cycleDays + ' 天规则执行，通过后下一轮按新周期'
+                : '所属分类已关闭批量复核策略；本轮复核仍按建单时的 ' + openT.cycleDays + ' 天规则执行，通过后文档覆盖继续生效或关闭保鲜'
+              await db.freshnessTickets.update(openT.id, {
+                timeline: [...(openT.timeline || []), buildFreshTimelineEntry('policy-rule-snap', 'system', label, nowIso0)]
+              })
+            }
+          } else skipped.unchanged++
+          continue
+        }
+        if (plan.action === 'disable') {
+          await db.docs.update(doc.id, { freshness: null })
+          disabled++
+        } else {
+          await db.docs.update(doc.id, { freshness: plan.patch })
+          plan.action === 'enable' ? enabled++ : recalced++
+        }
+        affected++
+      }
+      result = { status: 'ok', affected, enabled, recalced, disabled, skipped, policy }
+    })
+
+    await Promise.all([reload(), kb.reloadDocs(), kb.reloadCategories()])
     return result
   }
 
@@ -230,6 +404,8 @@ export const useFreshnessStore = defineStore('freshness', () => {
       if (!doc) { result = { status: 'missing' }; return }
       if (isGuestUser(userId)) { result = { status: 'guest' }; return }
       if (!canManageFreshness(doc, userId, role)) { result = { status: 'denied' }; return }
+      // 跟随分类策略的文档不能逐篇关闭：关闭由管理员调整分类策略完成；如需例外先设置文档单独覆盖
+      if (doc.freshness?.source === FRESH_SOURCE.CATEGORY) { result = { status: 'managed-by-category' }; return }
 
       const nowIso = new Date().toISOString()
       const openList = await db.freshnessTickets
@@ -332,7 +508,8 @@ export const useFreshnessStore = defineStore('freshness', () => {
   }
 
   // 审批/撤回事务内联动复核单（由 review store 在同事务调用，tables 含 db.freshnessTickets）。
-  // approve：复核通过 → 恢复引用、按周期重算到期点、写入版本标记由 review store 完成；
+  // approve：复核通过 → 恢复引用、按「当前最新生效策略」重算到期点（在途单保留的旧规则仅管本轮；
+  //   文档单独覆盖优先，其次继承分类策略，均无则关闭保鲜）、写入版本标记由 review store 完成；
   // reject ：驳回 → 复核单回到待整改，解除与评审单的送审关联，问答引用继续暂停；
   // withdraw：撤回送审 → 同 reject，回到待整改。
   async function syncFreshTicket(review, action, note, userId, nowIso) {
@@ -341,30 +518,47 @@ export const useFreshnessStore = defineStore('freshness', () => {
     if (!ticket) return
 
     if (action === 'approve') {
-      const days = Number(ticket.cycleDays) || Number(review.snapshot && 0) || 0
-      const nextDueAt = calcDueAt(ticket.cycleDays, nowIso)
+      // 以库内最新文档 + 分类策略解析下一轮周期（分类批量调整/文档覆盖在本轮复核期间可能已变化）
+      const latestDoc = await db.docs.get(review.docId)
+      const latestCat = latestDoc?.categoryId ? await db.categories.get(latestDoc.categoryId) : null
+      const policy = latestDoc ? resolveFreshPolicy(latestDoc, latestCat) : null
+      const nextDueAt = policy ? calcDueAt(policy.cycleDays, nowIso) : null
+      const ruleChanged = policy && (policy.cycleDays !== Number(ticket.cycleDays) || policy.source !== (ticket.cycleSource || FRESH_SOURCE.DOC))
       const approved = {
         ...ticket,
         status: FRESH.APPROVED,
         decidedBy: userId,
         decidedAt: nowIso,
         decisionNote: note || '',
+        nextCycleDays: policy?.cycleDays || null,
+        nextCycleSource: policy?.source || null,
         nextDueAt
       }
+      if (ruleChanged) {
+        approved.timeline = [
+          ...(ticket.timeline || []),
+          buildFreshTimelineEntry('policy-rule-snap', 'system', '本轮按建单时的 ' + ticket.cycleDays + ' 天规则完成；下一轮起按' + (policy.source === FRESH_SOURCE.CATEGORY ? '分类策略' : '文档单独设置') + ' ' + policy.cycleDays + ' 天执行', nowIso)
+        ]
+      }
       await db.freshnessTickets.put(approved)
-      const doc = await db.docs.get(review.docId)
-      if (doc) {
-        await db.docs.update(review.docId, {
-          freshness: {
-            cycleDays: ticket.cycleDays,
-            nextDueAt,
-            round: ticket.round,
-            activeTicket: null,
-            lastApprovedAt: nowIso,
-            lastApprovedBy: userId,
-            lastReviewId: review.id
-          }
-        })
+      if (latestDoc) {
+        if (!policy) {
+          // 分类策略已关闭且文档无单独覆盖：本轮收尾后关闭保鲜（历史复核记录保留）
+          await db.docs.update(review.docId, { freshness: null })
+        } else {
+          await db.docs.update(review.docId, {
+            freshness: {
+              cycleDays: policy.cycleDays,
+              source: policy.source,
+              nextDueAt,
+              round: ticket.round,
+              activeTicket: null,
+              lastApprovedAt: nowIso,
+              lastApprovedBy: userId,
+              lastReviewId: review.id
+            }
+          })
+        }
       }
     } else {
       const rejected = action === 'reject'
@@ -392,8 +586,9 @@ export const useFreshnessStore = defineStore('freshness', () => {
 
   return {
     tickets, loaded, now, loadAll, reload,
-    activeTicketMap, activeTicketOf, ticketsOfDoc, openTicketsForOwner,
+    activeTicketMap, activeTicketOf, ticketsOfDoc, openTicketsForOwner, policyOf,
     pausedCount, submittedCount,
-    sweepDue, setFreshCycle, disableFreshness, submitFreshReview, syncFreshTicket, deleteFreshnessOfDoc
+    sweepDue, setFreshCycle, resetDocFreshCycle, setCategoryFreshPolicy,
+    disableFreshness, submitFreshReview, syncFreshTicket, deleteFreshnessOfDoc
   }
 })

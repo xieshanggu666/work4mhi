@@ -47,6 +47,8 @@ const mergeNotice = ref('')
 const reviewSubmittedNotice = ref('')
 // 已提交保鲜复核的提示（由编辑器「保鲜整改」跳转携带）
 const freshSubmittedNotice = ref('')
+// 跨分类移动导致复核周期策略变化的提示（由编辑器保存跳转携带）
+const freshPlanNotice = ref('')
 
 const docId = computed(() => route.params.id)
 // 兼容旧数据：早期文档可能没有 versions 字段
@@ -208,6 +210,7 @@ onMounted(() => {
   mergeNotice.value = route.query.merged || ''
   reviewSubmittedNotice.value = route.query.reviewSubmitted || ''
   freshSubmittedNotice.value = route.query.freshSubmitted || ''
+  freshPlanNotice.value = route.query.freshPlan || ''
   refresh()
 })
 watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.value = false } })
@@ -232,6 +235,10 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
       <div v-if="freshSubmittedNotice" class="card fresh-submitted-note">
         <span>🧊 已提交保鲜复核：管理员复核通过后修订生效、问答引用恢复并重新计算复核周期；驳回则继续整改。</span>
         <button class="btn sm ghost" @click="freshSubmittedNotice = ''">知道了</button>
+      </div>
+      <div v-if="freshPlanNotice" class="card fresh-submitted-note">
+        <span>🏷 {{ freshPlanNotice }}</span>
+        <button class="btn sm ghost" @click="freshPlanNotice = ''">知道了</button>
       </div>
       <div v-if="reviewLocked" class="card review-lock">
         <span>⏳ 该文档正在评审中（{{ userById[pendingReview.submittedBy]?.name }} 发起）：当前展示的是评审前版本，正文已锁定，审批通过后更新。</span>

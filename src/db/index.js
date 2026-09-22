@@ -66,6 +66,24 @@ export class KnowledgeDB extends Dexie {
     this.version(8).stores({
       retirements: 'id, status, docId, replacementDocId, initiatedBy, decidedBy, createdAt, decidedAt'
     })
+    // v9：按分类批量设置复核周期（分类策略）+ 文档单独覆盖
+    // - categories.freshPolicy：管理员为分类批量配置复核周期 { cycleDays, updatedAt, updatedBy }；
+    // - docs.freshness 增加 source（'category' 跟随分类 / 'doc' 文档覆盖）；
+    // - freshnessTickets 增加 cycleSource/categoryId：在途复核单保留建单时的规则快照。
+    // 迁移：已有逐篇配置全部标记为 'doc'（保持现有周期/到期点，不被后续分类策略覆盖）；
+    //       在途复核单补规则快照（旧单无 source，按文档覆盖处理）。
+    this.version(9).upgrade(async (tx) => {
+      // 在途复核单补规则快照（旧单无 source，按文档覆盖处理）
+      await tx.table('freshnessTickets').toCollection().modify((t) => {
+        if (t.cycleDays != null && !t.cycleSource) t.cycleSource = 'doc'
+      })
+      // 已有逐篇配置全部标记为 'doc'：保持现有周期/到期点，不被后续分类策略覆盖
+      await tx.table('docs').toCollection().modify((d) => {
+        if (d.freshness && Number(d.freshness.cycleDays) > 0 && !d.freshness.source) {
+          d.freshness.source = 'doc'
+        }
+      })
+    })
   }
 }
 

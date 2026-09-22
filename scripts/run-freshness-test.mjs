@@ -86,9 +86,12 @@ await freshness.sweepDue()
 const open2 = await db.freshnessTickets.where('docId').equals(d2.id).toArray()
 assert(open2.filter((x) => x.status === FRESH.OPEN).length === 1, '重复扫描不产生重复复核单')
 
-// 流转中不可改周期
+// 流转中调整周期：作为文档覆盖落库（下一轮规则），本轮在途单保留 30 天规则快照
 r = await freshness.setFreshCycle(d2.id, 90, owner)
-assert(r.status === 'has-open', '存在流转复核单时调整周期被拒绝')
+assert(r.status === 'deferred', '存在流转复核单时调整周期返回 deferred（下一轮生效）')
+const d2Deferred = await db.docs.get(d2.id)
+assert(d2Deferred.freshness.cycleDays === 90 && d2Deferred.freshness.source === 'doc' && d2Deferred.freshness.activeTicket === t2.id, '文档覆盖已落库且在途单关联不变')
+assert(freshness.activeTicketOf(d2.id).cycleDays === 30, '在途复核单保留建单时的 30 天规则快照')
 
 // ---------- 3. 修订送审 → 管理员批准 → 恢复引用并重算周期 ----------
 console.log('\n[3] 修订送审与管理员批准')

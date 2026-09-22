@@ -1,21 +1,76 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useKbStore } from '@/stores/kb'
 import { useAuthStore } from '@/stores/auth'
 import { useFreshnessStore } from '@/stores/freshness'
 import DocPill from '@/components/common/DocPill.vue'
 import { formatFull, avatarColor } from '@/utils/format'
-import { FRESH, freshStatusLabel, freshStatusCls, dueText, freshTimelineLabel, cycleDaysLabel, isFreshnessEnabled } from '@/utils/freshness'
+import {
+  FRESH, FRESH_CYCLES, freshStatusLabel, freshStatusCls, dueText, freshTimelineLabel,
+  cycleDaysLabel, isFreshnessEnabled, categoryPolicy, FRESH_SOURCE
+} from '@/utils/freshness'
 const router = useRouter()
 const kb = useKbStore()
 const auth = useAuthStore()
 const freshness = useFreshnessStore()
 
 const tab = ref('active') // active | mine | all
+const busyId = ref('')
+const policyMsg = reactive({})
+// 各分类批量策略的编辑草稿（天数，0/'' 表示关闭策略）
+const drafts = reactive({})
 
 const docById = computed(() => Object.fromEntries(kb.docs.map((d) => [d.id, d])))
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
+const isAdmin = computed(() => auth.user?.role === 'admin')
+
+// 分类策略视图：当前策略、草稿、覆盖该分类的文档数统计
+const categoryRows = computed(() =>
+  kb.categories.map((c) => {
+    const policy = categoryPolicy(c)
+    const docsInCat = kb.docs.filter((d) => d.categoryId === c.id)
+    const overrides = docsInCat.filter((d) => d.freshness?.source === FRESH_SOURCE.DOC || (d.freshness && !d.freshness.source)).length
+    const following = docsInCat.filter((d) => d.freshness?.source === FRESH_SOURCE.CATEGORY).length
+    const openTickets = docsInCat.filter((d) => freshness.activeTicketOf(d.id)).length
+    return { cat: c, policy, days: policy?.cycleDays || null, docs: docsInCat.length, overrides, following, openTickets }
+  })
+)
+
+function draftOf(row) {
+  if (drafts[row.cat.id] === undefined) drafts[row.cat.id] = row.days ? String(row.days) : ''
+  return drafts[row.cat.id]
+}
+
+async function applyPolicy(row) {
+  if (busyId.value) return
+  const raw = draftOf(row)
+  const days = raw === '' || raw === '0' ? null : Number(raw)
+  if (days !== null && !(days > 0)) { alert('请填写有效的复核周期天数'); return }
+  const verb = days ? `将分类「${row.cat.name}」下文档的复核周期批量设置为 ${days} 天` : `关闭分类「${row.cat.name}」的批量复核策略`
+  const detail = days
+    ? '跟随分类策略的文档将立即重算到期点；文档单独覆盖与在途复核单不受影响（在途单保留规则快照，本轮通过后下一轮生效）。'
+    : '仅清除跟随分类策略的配置；文档单独覆盖保留。'
+  if (!confirm(verb + '？\n' + detail)) return
+  busyId.value = row.cat.id
+  try {
+    const res = await freshness.setCategoryFreshPolicy(row.cat.id, days, auth.user)
+    if (res.status === 'ok') {
+      const parts = []
+      if (res.enabled) parts.push(res.enabled + ' 篇新启用')
+      if (res.recalced) parts.push(res.recalced + ' 篇重算到期')
+      if (res.disabled) parts.push(res.disabled + ' 篇关闭')
+      if (res.skipped.override) parts.push(res.skipped.override + ' 篇文档覆盖保留')
+      if (res.skipped.open) parts.push(res.skipped.open + ' 篇在途复核单保留规则快照')
+      policyMsg[row.cat.id] = '已生效：' + (parts.join('，') || '无文档需要变更')
+      setTimeout(() => { delete policyMsg[row.cat.id] }, 6000)
+    } else if (res.status === 'denied' || res.status === 'guest') {
+      alert('仅管理员可以按分类批量设置复核周期。')
+    }
+  } finally {
+    busyId.value = ''
+  }
+}
 
 const sorted = computed(() =>
   [...freshness.tickets].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
@@ -62,6 +117,29 @@ onMounted(async () => {
       </div>
     </header>
 
+    <!-- 管理员：按分类批量设置复核周期 -->
+    <section v-if="isAdmin" class="policies card">
+      <div class="pol-head">
+        <h3>🏷 分类复核策略</h3>
+        <span class="dim">按分类批量设置复核周期；文档可在详情页单独覆盖。策略调整即时重算跟随文档的到期计划，在途复核单保留建单时规则快照。</span>
+      </div>
+      <div v-for="row in categoryRows" :key="row.cat.id" class="pol-row">
+        <div class="pol-name">
+          <span class="pol-cat">{{ row.cat.name }}</span>
+          <span class="pol-stat dim">{{ row.docs }} 篇文档 · {{ row.following }} 篇跟随策略 · {{ row.overrides }} 篇单独覆盖<span v-if="row.openTickets"> · {{ row.openTickets }} 篇复核中</span></span>
+        </div>
+        <div class="pol-edit">
+          <div class="chips">
+            <span v-for="c in FRESH_CYCLES" :key="c.days" class="chip" :class="{ on: Number(draftOf(row)) === c.days }" @click="drafts[row.cat.id] = String(c.days)">{{ c.label }}</span>
+          </div>
+          <input v-model="drafts[row.cat.id]" class="custom" type="number" min="0" placeholder="天，留空关闭" />
+          <button class="btn sm primary" :disabled="busyId === row.cat.id" @click="applyPolicy(row)">批量应用</button>
+          <span v-if="row.days" class="cur dim">当前：{{ cycleDaysLabel(row.days) }}</span>
+        </div>
+        <div v-if="policyMsg[row.cat.id]" class="pol-msg">✅ {{ policyMsg[row.cat.id] }}</div>
+      </div>
+    </section>
+
     <div v-if="tab === 'active' && upcoming.length" class="upcoming card">
       <div class="up-title">⏳ 临近复核（保鲜运行中）</div>
       <div class="up-list">
@@ -95,7 +173,7 @@ onMounted(async () => {
             <span class="ava" :style="{ background: avatarColor(docById[t.docId]?.ownerId || '?') }">{{ (userById[docById[t.docId]?.ownerId]?.avatar || '?') }}</span>
             负责人：{{ userById[docById[t.docId]?.ownerId]?.name || docById[t.docId]?.ownerId || '—' }}
           </span>
-          <span class="dim">周期 {{ cycleDaysLabel(t.cycleDays) }}</span>
+          <span class="dim">周期 {{ cycleDaysLabel(t.cycleDays) }}（{{ t.cycleSource === 'category' ? '分类策略' : '文档设置' }}）</span>
           <span v-if="t.submittedBy" class="dim">
             {{ userById[t.submittedBy]?.name || t.submittedBy }} 送审
           </span>
@@ -128,6 +206,21 @@ onMounted(async () => {
 .tabs button { border: 1px solid var(--border); background: var(--panel); padding: 7px 16px; border-radius: 999px; cursor: pointer; font-size: 13px; color: var(--text-2); }
 .tabs button.on { background: #0e7490; border-color: #0e7490; color: #fff; font-weight: 600; }
 .tabs em { font-style: normal; opacity: 0.7; margin-left: 2px; }
+.policies { padding: 16px 20px; margin-bottom: 16px; }
+.pol-head { margin-bottom: 12px; }
+.pol-head h3 { margin: 0 0 4px; font-size: 15px; }
+.pol-row { padding: 12px 0; border-top: 1px dashed var(--border); }
+.pol-row:first-of-type { border-top: none; }
+.pol-name { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.pol-cat { font-weight: 600; font-size: 14px; }
+.pol-stat { font-size: 12px; }
+.pol-edit { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pol-edit .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { padding: 3px 11px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-2); cursor: pointer; font-size: 12.5px; }
+.chip.on { background: #0e7490; border-color: #0e7490; color: #fff; }
+.pol-edit .custom { width: 110px; padding: 4px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; }
+.pol-msg { margin-top: 8px; font-size: 12.5px; color: #15803d; }
+.cur { white-space: nowrap; }
 .upcoming { margin-top: 16px; padding: 14px 18px; }
 .up-title { font-weight: 600; font-size: 13px; color: var(--text-2); margin-bottom: 10px; }
 .up-list { display: flex; flex-wrap: wrap; gap: 8px; }

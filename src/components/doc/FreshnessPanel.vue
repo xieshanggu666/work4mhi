@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { useKbStore } from '@/stores/kb'
 import { useFreshnessStore } from '@/stores/freshness'
 import { useReviewStore } from '@/stores/review'
 import { useAccessStore } from '@/stores/access'
@@ -9,8 +10,9 @@ import { formatDate, formatFull, avatarColor } from '@/utils/format'
 import { GUEST_ID } from '@/utils/permission'
 import { canReviewDecision, canSubmitReview } from '@/utils/review'
 import {
-  FRESH, FRESH_CYCLES, cycleDaysLabel, freshStatusLabel, freshStatusCls,
-  canManageFreshness, dueText, freshTimelineLabel, isFreshnessEnabled
+  FRESH, FRESH_CYCLES, FRESH_SOURCE, cycleDaysLabel, freshStatusLabel, freshStatusCls,
+  canManageFreshness, dueText, freshTimelineLabel, isFreshnessEnabled,
+  categoryPolicy, freshSourceLabel, ticketRuleSnapshot
 } from '@/utils/freshness'
 
 const props = defineProps({
@@ -19,6 +21,7 @@ const props = defineProps({
 
 const router = useRouter()
 const auth = useAuthStore()
+const kb = useKbStore()
 const freshness = useFreshnessStore()
 const reviewStore = useReviewStore()
 const accessStore = useAccessStore()
@@ -26,7 +29,6 @@ const accessStore = useAccessStore()
 // 周期设置表单
 const cycleDays = ref(props.doc.freshness?.cycleDays || 90)
 const customDays = ref('')
-const setting = ref(false)
 const justSaved = ref('')
 const busy = ref(false)
 const noteText = ref('')
@@ -37,6 +39,15 @@ const expanded = ref({})
 const ticket = computed(() => freshness.activeTicketOf(props.doc.id))
 const history = computed(() => freshness.ticketsOfDoc(props.doc.id).filter((t) => !ticket.value || t.id !== ticket.value.id))
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
+
+// 两级策略：所属分类的批量策略 + 文档当前生效配置
+const category = computed(() => kb.catMap[props.doc.categoryId] || null)
+const catPolicy = computed(() => categoryPolicy(category.value))
+const effective = computed(() => freshness.policyOf(props.doc))
+const isOverride = computed(() => props.doc.freshness?.source === FRESH_SOURCE.DOC || (!!props.doc.freshness && !props.doc.freshness.source))
+const isFollowCategory = computed(() => props.doc.freshness?.source === FRESH_SOURCE.CATEGORY)
+// 在途单建单时的规则快照（可能与当前策略不一致：本轮按快照执行）
+const ticketRule = computed(() => ticketRuleSnapshot(ticket.value))
 
 const isManager = computed(() => canManageFreshness(props.doc, auth.user?.id, auth.user?.role))
 const activeGrant = computed(() => accessStore.grantOf(props.doc.id, auth.user?.id))
@@ -68,16 +79,43 @@ async function saveCycle() {
   busy.value = true
   try {
     const res = await freshness.setFreshCycle(props.doc.id, days, auth.user)
-    if (res.status === 'ok') {
-      justSaved.value = '已' + (res.action === 'change' ? '调整复核周期为 ' + days + ' 天' : '开启知识保鲜，复核周期 ' + days + ' 天')
+    if (res.status === 'ok' || res.status === 'deferred') {
+      justSaved.value = res.status === 'deferred'
+        ? '已保存文档单独周期 ' + days + ' 天，本轮复核通过后下一轮生效'
+        : res.action === 'override'
+          ? '本文档已单独覆盖为 ' + days + ' 天，不再跟随分类策略'
+          : res.action === 'change'
+            ? '已调整复核周期为 ' + days + ' 天'
+            : '已开启知识保鲜，复核周期 ' + days + ' 天'
       customDays.value = ''
-      setTimeout(() => { justSaved.value = '' }, 3000)
-    } else if (res.status === 'has-open') {
-      alert('当前存在流转中的复核单，请先完成本轮复核后再调整周期。')
+      setTimeout(() => { justSaved.value = '' }, 4000)
     } else if (res.status === 'denied' || res.status === 'guest') {
       alert('仅文档拥有者或管理员可以设置复核周期。')
+    } else if (res.status === 'bad-cycle') {
+      alert('请填写有效的复核周期天数。')
     } else {
       alert('保存失败，请重试')
+    }
+  } finally {
+    busy.value = false
+  }
+}
+
+async function resetToCategory() {
+  if (busy.value) return
+  if (!catPolicy.value) {
+    if (!confirm('所属分类未设置批量复核策略，取消覆盖后将关闭本文档知识保鲜（历史复核记录保留）。确定？')) return
+  }
+  busy.value = true
+  try {
+    const res = await freshness.resetDocFreshCycle(props.doc.id, auth.user)
+    if (res.status === 'ok' || res.status === 'deferred') {
+      justSaved.value = res.status === 'deferred'
+        ? '已取消文档覆盖，本轮复核通过后恢复跟随分类策略'
+        : res.cycleDays ? '已恢复跟随分类策略（' + res.cycleDays + ' 天）' : '分类未设置策略，已关闭知识保鲜'
+      setTimeout(() => { justSaved.value = '' }, 4000)
+    } else if (res.status === 'denied' || res.status === 'guest') {
+      alert('仅文档拥有者或管理员可以修改复核周期。')
     }
   } finally {
     busy.value = false
@@ -176,6 +214,22 @@ function statusCls(s) { return freshStatusCls(s) }
         ❄ {{ cycleDaysLabel(doc.freshness.cycleDays) }}复核 · {{ dueText(doc, null, freshness.now) }}
       </span>
       <span v-else class="st st-off">未启用</span>
+      <span v-if="isFreshnessEnabled(doc)" class="src-tag" :class="{ cat: isFollowCategory }">
+        {{ isFollowCategory ? '🏷 跟随分类策略' : '📌 文档单独设置' }}
+      </span>
+    </div>
+
+    <!-- 当前生效规则说明 -->
+    <div v-if="catPolicy || isFreshnessEnabled(doc)" class="policy-line dim">
+      <template v-if="ticket && ticketRule">
+        本轮复核按建单时规则：<b>{{ cycleDaysLabel(ticketRule.cycleDays) }}</b>（{{ freshSourceLabel(ticketRule.source) || '文档策略' }}）
+        <template v-if="effective && (effective.cycleDays !== ticketRule.cycleDays || effective.source !== ticketRule.source)">
+          ；当前策略已调整为 <b>{{ cycleDaysLabel(effective.cycleDays) }}</b>，本轮通过后下一轮生效
+        </template>
+      </template>
+      <template v-else-if="catPolicy">
+        分类「{{ category?.name }}」批量策略：{{ cycleDaysLabel(catPolicy.cycleDays) }}<template v-if="isOverride">；本文档已单独覆盖为 <b>{{ cycleDaysLabel(doc.freshness.cycleDays) }}</b></template>
+      </template>
     </div>
 
     <div v-if="justSaved" class="toast-line">✅ {{ justSaved }}</div>
@@ -227,27 +281,31 @@ function statusCls(s) { return freshStatusCls(s) }
       </div>
     </template>
 
-    <!-- 周期配置（负责人/管理员） -->
+    <!-- 周期配置（负责人/管理员）：文档可随时单独覆盖分类策略；在途单期间调整下一轮生效 -->
     <div v-if="isManager" class="config">
-      <template v-if="!ticket">
-        <div class="cfg-line">
-          <label>复核周期</label>
-          <div class="chips">
-            <span v-for="c in FRESH_CYCLES" :key="c.days" class="chip" :class="{ on: !customDays && Number(cycleDays) === c.days }" @click="cycleDays = c.days; customDays = ''">{{ c.label }}</span>
-          </div>
-          <input v-model="customDays" class="custom" type="number" min="1" placeholder="自定义天数" />
+      <div class="cfg-line">
+        <label>文档单独周期</label>
+        <div class="chips">
+          <span v-for="c in FRESH_CYCLES" :key="c.days" class="chip" :class="{ on: !customDays && Number(cycleDays) === c.days }" @click="cycleDays = c.days; customDays = ''">{{ c.label }}</span>
         </div>
-        <div class="cfg-acts">
-          <button class="btn sm primary" :disabled="busy" @click="saveCycle">{{ isFreshnessEnabled(doc) ? '保存周期' : '开启知识保鲜' }}</button>
-          <button v-if="isFreshnessEnabled(doc)" class="btn sm ghost" :disabled="busy" @click="disableFreshnessAction">关闭保鲜</button>
-        </div>
-        <p v-if="isFreshnessEnabled(doc) && doc.freshness?.lastApprovedAt" class="dim last">
-          上一轮复核由 {{ userById[doc.freshness.lastApprovedBy]?.name || doc.freshness.lastApprovedBy }} 于 {{ formatDate(doc.freshness.lastApprovedAt) }} 通过。
-        </p>
-      </template>
-      <div v-else class="cfg-locked dim">
-        本轮复核完成后可调整/关闭复核周期。当前周期：{{ cycleDaysLabel(ticket.cycleDays) }}。
+        <input v-model="customDays" class="custom" type="number" min="1" placeholder="自定义天数" />
       </div>
+      <div class="cfg-acts">
+        <button class="btn sm primary" :disabled="busy" @click="saveCycle">
+          {{ isFreshnessEnabled(doc) ? '保存文档周期' : '开启知识保鲜' }}
+        </button>
+        <button v-if="isOverride && catPolicy" class="btn sm" :disabled="busy" @click="resetToCategory">恢复跟随分类（{{ cycleDaysLabel(catPolicy.cycleDays) }}）</button>
+        <button v-if="isOverride && !catPolicy && isFreshnessEnabled(doc)" class="btn sm ghost" :disabled="busy" @click="disableFreshnessAction">关闭本文档保鲜</button>
+      </div>
+      <p v-if="ticket" class="dim next-hint">
+        ⏳ 本轮复核进行中，周期调整将在复核通过后从下一轮生效；在途复核单保留当前规则快照。
+      </p>
+      <p v-if="isFollowCategory && catPolicy" class="dim next-hint">
+        当前跟随分类「{{ category?.name }}」策略（{{ cycleDaysLabel(catPolicy.cycleDays) }}），管理员调整分类策略时会自动重算到期点；也可以在上方单独覆盖本文档。
+      </p>
+      <p v-if="isFreshnessEnabled(doc) && doc.freshness?.lastApprovedAt && !ticket" class="dim last">
+        上一轮复核由 {{ userById[doc.freshness.lastApprovedBy]?.name || doc.freshness.lastApprovedBy }} 于 {{ formatDate(doc.freshness.lastApprovedAt) }} 通过。
+      </p>
     </div>
     <p v-else-if="!isFreshnessEnabled(doc)" class="dim no-perm">该文档未启用知识保鲜，仅拥有者或管理员可设置复核周期。</p>
 
@@ -284,6 +342,10 @@ function statusCls(s) { return freshStatusCls(s) }
 .st-no { background: #fee2e2; color: #b91c1c; }
 .st-ok { background: #dcfce7; color: #15803d; }
 .st-off { background: var(--panel-2); color: var(--text-3); }
+.src-tag { font-size: 11px; padding: 2px 10px; border-radius: 999px; background: var(--panel-2); color: var(--text-3); border: 1px solid var(--border); }
+.src-tag.cat { background: #eef2ff; color: #4338ca; border-color: #c7d2fe; }
+.policy-line { margin: 0 0 10px; font-size: 12.5px; }
+.next-hint { margin-top: 8px; }
 .toast-line { color: #15803d; font-size: 13px; margin-bottom: 10px; }
 .ticket { border: 1px solid #a5f3fc; background: #ecfeff; border-radius: 10px; padding: 12px 14px; }
 .t-meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; margin-bottom: 6px; }
@@ -307,7 +369,6 @@ function statusCls(s) { return freshStatusCls(s) }
 .custom { width: 120px; padding: 5px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; }
 .cfg-acts { display: flex; gap: 8px; }
 .last { margin-top: 8px; }
-.cfg-locked { padding: 8px 12px; background: var(--panel-2); border-radius: 8px; }
 .no-perm { font-size: 12px; color: var(--text-3); margin-top: 10px; }
 .history { margin-top: 14px; }
 .h-title { font-size: 12px; color: var(--text-3); margin-bottom: 6px; }

@@ -6,6 +6,9 @@ import { ensureVersions, mergeDocFields, docSnapshot } from '@/utils/version'
 import { buildTimelineEntry } from '@/utils/review'
 import { GAP } from '@/utils/gap'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
+import {
+  FRESH_SOURCE, categoryPolicy, planCategoryMove, initialFreshnessForCategory
+} from '@/utils/freshness'
 import { canEditContent, canEditDoc, canDeleteDoc, GUEST_ID } from '@/utils/permission'
 import { useAuthStore } from './auth'
 import { useGapStore } from './gap'
@@ -33,6 +36,10 @@ export const useKbStore = defineStore('kb', () => {
     docs.value = await db.docs.toArray()
   }
 
+  async function reloadCategories() {
+    categories.value = await db.categories.toArray()
+  }
+
   async function getDoc(id) {
     await loadAll()
     return docs.value.find((d) => d.id === id) || null
@@ -53,10 +60,13 @@ export const useKbStore = defineStore('kb', () => {
       return { status: 'forbidden' }
     }
     const now = new Date().toISOString()
+    const categoryId = payload.categoryId || categories.value[0]?.id || null
+    // 新建文档默认继承所属分类的复核周期策略（分类无策略则不启用保鲜）
+    const freshPolicy = categoryId ? categoryPolicy(catMap.value[categoryId]) : null
     const doc = {
       id: uid('doc'),
       title: payload.title || '无标题文档',
-      categoryId: payload.categoryId || categories.value[0]?.id || null,
+      categoryId,
       tagIds: payload.tagIds || [],
       body: payload.body || '',
       visibility: payload.visibility || 'public',
@@ -64,6 +74,7 @@ export const useKbStore = defineStore('kb', () => {
       activeReviewId: null,
       ownerId: currentUser?.id || 'u-guest',
       editors: [currentUser?.id || 'u-guest'],
+      freshness: initialFreshnessForCategory(freshPolicy, now),
       createdAt: now,
       updatedAt: now,
       versions: [{ version: 1, savedAt: now, savedBy: currentUser?.id || 'u-guest', note: '创建文档', snapshot: docSnapshot(payload) }]
@@ -88,7 +99,7 @@ export const useKbStore = defineStore('kb', () => {
     const isGuest = savedBy === GUEST_ID
     let result = null
     // 读 + 写放在同一事务中，保证「权限/版本检测 → 合并 → 追加版本记录」不被其他窗口的写入打断
-    await db.transaction('rw', db.docs, db.accessRequests, db.shares, db.reviews, async () => {
+    await db.transaction('rw', db.docs, db.accessRequests, db.shares, db.reviews, db.freshnessTickets, db.categories, async () => {
       const existing = await db.docs.get(id)
       if (!existing) { result = { status: 'missing' }; return }
       // 事务内重读评审状态：评审中锁定仅管理员可直接写（管理员并发修改通道），
@@ -157,15 +168,47 @@ export const useKbStore = defineStore('kb', () => {
       const versionNote = autoMerged.length
         ? (note || '编辑文档') + '（自动合并：' + autoMerged.join('、') + '）'
         : (note || '编辑文档')
+
+      // 跨分类移动：跟随分类策略的保鲜配置按新分类策略重算；文档单独覆盖的周期保持不变。
+      // 在途复核单保留旧规则快照（周期/到期不变），本轮通过后下一轮按新分类策略执行。
+      let freshnessPatch
+      let crossFreshNote = ''
+      if (Object.prototype.hasOwnProperty.call(fields, 'categoryId') && fields.categoryId !== existing.categoryId) {
+        const f = existing.freshness
+        const isFollowCategory = f && f.source === FRESH_SOURCE.CATEGORY
+        if (isFollowCategory) {
+          const openFresh = await db.freshnessTickets
+            .where('docId').equals(id)
+            .filter((t) => t.status === 'open' || t.status === 'submitted' || t.status === 'rejected').first()
+          const newCat = fields.categoryId ? await db.categories.get(fields.categoryId) : null
+          const newPolicy = categoryPolicy(newCat)
+          if (openFresh) {
+            // 在途单：文档配置保留本轮规则不动，留痕提示下一轮落到新分类策略
+            freshnessPatch = undefined
+            crossFreshNote = newPolicy
+              ? '文档转入新分类：本轮复核仍按原分类周期 ' + f.cycleDays + ' 天执行，通过后下一轮按新分类策略 ' + newPolicy.cycleDays + ' 天'
+              : '文档转入未设置复核策略的分类：本轮复核仍按原周期 ' + f.cycleDays + ' 天执行，通过后关闭保鲜'
+            await db.freshnessTickets.update(openFresh.id, {
+              timeline: [...(openFresh.timeline || []), { action: 'policy-rule-snap', by: 'system', note: crossFreshNote, at: now }]
+            })
+          } else {
+            const plan = planCategoryMove(existing, fields.categoryId, newPolicy, now)
+            if (plan.action === 'recalc') { freshnessPatch = plan.patch; crossFreshNote = '文档转入新分类，复核周期按分类策略调整为 ' + plan.patch.cycleDays + ' 天' }
+            else if (plan.action === 'disable') { freshnessPatch = null; crossFreshNote = '文档转入未设置复核策略的分类，已关闭知识保鲜' }
+          }
+        }
+      }
+
       const updated = {
         ...existing,
         ...fields,
+        ...(freshnessPatch !== undefined ? { freshness: freshnessPatch } : {}),
         updatedAt: now,
         // 版本记录升级为内容快照：保存后的完整字段随版本留档，供历史对比与恢复评审使用
         versions: [...versions, { version: currentVersion + 1, savedAt: now, savedBy, note: versionNote, snapshot: docSnapshot({ ...existing, ...fields }) }]
       }
       await db.docs.put(updated)
-      result = { status: 'saved', doc: updated, autoMerged }
+      result = { status: 'saved', doc: updated, autoMerged, crossFreshNote }
     })
     await reloadDocs()
     return result
@@ -254,7 +297,7 @@ export const useKbStore = defineStore('kb', () => {
 
   return {
     docs, categories, tags, comments, loaded,
-    catMap, tagMap, loadAll, reloadDocs, getDoc, getDocFresh, createDoc, updateDoc, deleteDoc,
+    catMap, tagMap, loadAll, reloadDocs, reloadCategories, getDoc, getDocFresh, createDoc, updateDoc, deleteDoc,
     addCategory, addTag, addComment, commentsOf
   }
 })

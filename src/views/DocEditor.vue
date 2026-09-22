@@ -168,6 +168,7 @@ async function submit(force = false) {
       dismissBackup()
       localStorage.removeItem(draftKey)
       const query = res.autoMerged?.length ? { merged: fieldLabels(res.autoMerged).join('、') } : {}
+      if (res.crossFreshNote) query.freshPlan = res.crossFreshNote
       router.push({ path: '/docs/' + route.params.id, query })
     } else {
       const d = await kb.createDoc(payload, auth.user)

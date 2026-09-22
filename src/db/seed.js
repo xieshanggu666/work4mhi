@@ -371,8 +371,9 @@ const seedReview5 = {
 // v3 文档访问申请演示数据（doc-9 保密文档上的限时阅读/协作授权、撤销与到期留痕）；
 // v4 版本快照回填与 doc-2 恢复演示（v2 误删 + rev-5 恢复评审通过 + v3 恢复边界标记）；
 // v5 知识保鲜演示（doc-8 逾期整改中 / doc-1 修订送审中 / doc-5 复核通过 / doc-6 保鲜运行中）；
-// v6 责任交接演示（ho-1 待确认 / ho-2 已完成含历史归属 / ho-3 并发变更失败回退）
-const SEED_VER = '6'
+// v6 责任交接演示（ho-1 待确认 / ho-2 已完成含历史归属 / ho-3 并发变更失败回退）；
+// v7 分类批量复核周期（c-ops/c-life 分类策略，doc-6/doc-5 文档单独覆盖不受影响）
+const SEED_VER = '7'
 
 async function isSeeded() {
   return (await getMeta('seeded')) === SEED_VER
@@ -571,7 +572,7 @@ const seedFreshReviews = [
 const seedFreshTickets = [
   {
     id: 'fr-1', docId: 'doc-8', round: 1, status: 'rejected',
-    cycleDays: 30, dueAt: ago(2 * d),
+    cycleDays: 30, cycleSource: 'doc', categoryId: 'c-dev', dueAt: ago(2 * d),
     reviewId: null, submittedBy: 'u-chen', submittedAt: ago(1 * d + 4 * h),
     decidedBy: 'u-admin', decidedAt: ago(1 * d),
     decisionNote: '强制改密周期需与运维确认后再修订，请补充具体策略。',
@@ -584,7 +585,7 @@ const seedFreshTickets = [
   },
   {
     id: 'fr-2', docId: 'doc-4', round: 1, status: 'submitted',
-    cycleDays: 180, dueAt: ago(1 * d),
+    cycleDays: 180, cycleSource: 'doc', categoryId: 'c-product', dueAt: ago(1 * d),
     reviewId: 'rev-6', submittedBy: 'u-ziwei', submittedAt: ago(3 * h),
     decidedBy: null, decidedAt: null, decisionNote: '',
     createdAt: ago(1 * d),
@@ -595,11 +596,12 @@ const seedFreshTickets = [
   },
   {
     id: 'fr-3', docId: 'doc-5', round: 1, status: 'approved',
-    cycleDays: 365, dueAt: ago(10 * d),
+    cycleDays: 365, cycleSource: 'doc', categoryId: 'c-life', dueAt: ago(10 * d),
     reviewId: 'rev-7', submittedBy: 'u-admin', submittedAt: ago(10 * d),
     decidedBy: 'u-admin', decidedAt: ago(10 * d),
     decisionNote: '入职流程本季度无变化，确认继续有效。',
     nextDueAt: ago(-355 * d),
+    nextCycleDays: 365, nextCycleSource: 'doc',
     createdAt: ago(10 * d),
     timeline: [
       { action: 'due', by: 'system', at: ago(10 * d), note: '复核周期到点，自动生成复核单并暂停问答引用' },
@@ -615,21 +617,21 @@ async function ensureFreshnessSeed() {
   for (const rv of seedFreshReviews) {
     if (!(await db.reviews.get(rv.id))) await db.reviews.add(rv)
   }
-  // doc-8：30 天周期逾期整改中（问答引用暂停），沿用 rev-3 的驳回结论与 v1 版本
+  // doc-8：30 天周期逾期整改中（问答引用暂停），沿用 rev-3 的驳回结论与 v1 版本（文档单独设置）
   const doc8 = await db.docs.get('doc-8')
   if (doc8 && !doc8.freshness) {
-    await db.docs.update('doc-8', { freshness: { cycleDays: 30, nextDueAt: ago(2 * d), round: 1, activeTicket: 'fr-1' } })
+    await db.docs.update('doc-8', { freshness: { cycleDays: 30, source: 'doc', nextDueAt: ago(2 * d), round: 1, activeTicket: 'fr-1' } })
   }
-  // doc-4：保鲜复核送审中，文档锁定，正文仍为旧版（rev-6 快照通过后才回写）
+  // doc-4：保鲜复核送审中，文档锁定，正文仍为旧版（rev-6 快照通过后才回写，文档单独设置）
   const doc4 = await db.docs.get('doc-4')
   if (doc4 && !doc4.freshness) {
     await db.docs.update('doc-4', {
       publishState: 'in_review',
       activeReviewId: 'rev-6',
-      freshness: { cycleDays: 180, nextDueAt: ago(1 * d), round: 1, activeTicket: 'fr-2' }
+      freshness: { cycleDays: 180, source: 'doc', nextDueAt: ago(1 * d), round: 1, activeTicket: 'fr-2' }
     })
   }
-  // doc-5：上一轮「确认有效」复核通过，noChange 不产生新版本，周期重算至约 355 天后
+  // doc-5：上一轮「确认有效」复核通过，noChange 不产生新版本，周期重算至约 355 天后（文档单独设置）
   const doc5 = await db.docs.get('doc-5')
   if (doc5 && !doc5.freshness) {
     const approvedAt = ago(10 * d)
@@ -637,15 +639,42 @@ async function ensureFreshnessSeed() {
       updatedAt: approvedAt,
       lastReview: { reviewId: 'rev-7', status: 'approved', by: 'u-admin', at: approvedAt, note: '入职流程本季度无变化，确认继续有效。' },
       freshness: {
-        cycleDays: 365, nextDueAt: ago(-355 * d), round: 1, activeTicket: null,
+        cycleDays: 365, source: 'doc', nextDueAt: ago(-355 * d), round: 1, activeTicket: null,
         lastApprovedAt: approvedAt, lastApprovedBy: 'u-admin', lastReviewId: 'rev-7'
       }
     })
   }
-  // doc-6：90 天周期保鲜运行中，约 6 小时后到期（不到点，不生成复核单、不影响引用）
+  // doc-6：90 天周期保鲜运行中，约 6 小时后到期（不到点，不生成复核单、不影响引用，文档单独设置）
   const doc6 = await db.docs.get('doc-6')
   if (doc6 && !doc6.freshness) {
-    await db.docs.update('doc-6', { freshness: { cycleDays: 90, nextDueAt: ago(-6 * h), round: 0, activeTicket: null } })
+    await db.docs.update('doc-6', { freshness: { cycleDays: 90, source: 'doc', nextDueAt: ago(-6 * h), round: 0, activeTicket: null } })
+  }
+}
+
+// ---- 分类批量复核周期策略演示（v7 增量种子）----
+// 运维手册（c-ops）：半年批量复核 180 天。doc-6 为文档单独覆盖（90 天），不受分类策略影响。
+// 团队文化（c-life）：年度批量复核 365 天。doc-5 为文档单独覆盖（365 天，周期相同但保留覆盖）。
+// 开发文档（c-dev）不设置分类策略：doc-8 等沿用各自的逐篇配置（迁移数据即文档覆盖）。
+async function ensureFreshPolicySeed() {
+  const policies = {
+    'c-ops': 180,
+    'c-life': 365
+  }
+  for (const [catId, days] of Object.entries(policies)) {
+    const cat = await db.categories.get(catId)
+    if (cat && !cat.freshPolicy) {
+      await db.categories.update(catId, { freshPolicy: { cycleDays: days, updatedAt: ago(2 * d), updatedBy: 'u-admin' } })
+    }
+  }
+  // 分类策略覆盖范围内、无逐篇配置的文档：即时继承策略并重算到期点（迁移来的逐篇配置是 doc 覆盖，不会被覆盖）
+  const nowIso = new Date().toISOString()
+  const allDocs = await db.docs.toArray()
+  for (const d of allDocs) {
+    const days = policies[d.categoryId]
+    if (!days || d.freshness) continue
+    await db.docs.update(d.id, {
+      freshness: { cycleDays: days, source: 'category', nextDueAt: new Date(Date.now() + days * 24 * 3600 * 1000).toISOString(), round: 0, activeTicket: null, policyUpdatedAt: nowIso }
+    })
   }
 }
 
@@ -766,6 +795,7 @@ export async function ensureSeeded() {
     await ensureRestoreSeed()
     await ensureFreshnessSeed()
     await ensureHandoverSeed()
+    await ensureFreshPolicySeed()
   })
   await setMeta('seeded', SEED_VER)
 }

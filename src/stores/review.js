@@ -375,7 +375,7 @@ export const useReviewStore = defineStore('review', () => {
     const userId = currentUser?.id || GUEST_ID
     let result = { status: 'error' }
 
-    await db.transaction('rw', db.docs, db.reviews, db.gapTickets, db.freshnessTickets, async () => {
+    await db.transaction('rw', db.docs, db.reviews, db.gapTickets, db.freshnessTickets, db.categories, async () => {
       const review = await db.reviews.get(reviewId)
       if (!review) { result = { status: 'missing' }; return }
       if (review.status !== REVIEW.PENDING) { result = { status: 'closed', review }; return }
