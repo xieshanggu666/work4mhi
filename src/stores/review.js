@@ -8,6 +8,7 @@ import { GAP } from '@/utils/gap'
 import { canEditContent, GUEST_ID } from '@/utils/permission'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
 import { isFreshReview, isFreshNoChangeReview } from '@/utils/review'
+import { isDocOverride, materializeFromPolicy, isFreshTicketOpen } from '@/utils/freshness'
 import { useKbStore } from './kb'
 import { useGapStore } from './gap'
 import { useFreshnessStore } from './freshness'
@@ -375,7 +376,7 @@ export const useReviewStore = defineStore('review', () => {
     const userId = currentUser?.id || GUEST_ID
     let result = { status: 'error' }
 
-    await db.transaction('rw', db.docs, db.reviews, db.gapTickets, db.freshnessTickets, async () => {
+    await db.transaction('rw', db.docs, db.reviews, db.gapTickets, db.freshnessTickets, db.freshnessPolicies, async () => {
       const review = await db.reviews.get(reviewId)
       if (!review) { result = { status: 'missing' }; return }
       if (review.status !== REVIEW.PENDING) { result = { status: 'closed', review }; return }
@@ -476,6 +477,19 @@ export const useReviewStore = defineStore('review', () => {
           updatedAt: now,
           lastReview: { reviewId, status, by: userId, at: now, note: note || '', ...(newVersions.length ? { version: newVersions.length } : {}) },
           versions: newVersions
+        }
+        // 分类随审批变更：无文档级覆盖的文档按新分类策略重解析保鲜配置（新分类无策略则退出保鲜）；
+        // 有在途复核单时跳过——当轮按规则快照执行，结案时由保鲜联动按新分类策略重算
+        if (!fresh && review.snapshot.categoryId !== doc.categoryId && !isDocOverride(updated.freshness)) {
+          const openFresh = await db.freshnessTickets
+            .where('docId').equals(doc.id)
+            .filter((t) => isFreshTicketOpen(t)).first()
+          if (!openFresh) {
+            const pol = review.snapshot.categoryId
+              ? await db.freshnessPolicies.where('categoryId').equals(review.snapshot.categoryId).first()
+              : null
+            updated.freshness = pol ? materializeFromPolicy(pol, doc.freshness, now) : null
+          }
         }
         await db.docs.put(updated)
       } else {

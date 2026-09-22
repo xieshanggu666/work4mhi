@@ -1,7 +1,8 @@
 // 知识保鲜：复核周期、复核单状态、权限判定、到期/引用判定与留痕工具（均为纯函数，便于测试）
-// 流转：负责人（拥有者/管理员）设置复核周期 → 到期自动生成复核单（open，暂停问答引用）→
-// 编辑者修订送审（submitted，复用评审单锁定/审批通道）→ 管理员批准（approved，恢复引用并重算周期）
-// / 驳回（rejected，继续整改，可修订后重新送审）；每轮复核单与 timeline 全程保留。
+// 流转：负责人（拥有者/管理员）设置复核周期（或管理员按分类批量设置策略，文档可单独覆盖）→
+// 到期自动生成复核单（open，暂停问答引用）→ 编辑者修订送审（submitted，复用评审单锁定/审批通道）→
+// 管理员批准（approved，恢复引用并按当前规则重算周期）/ 驳回（rejected，继续整改，可修订后重新送审）；
+// 每轮复核单与 timeline 全程保留；在途复核单持有规则快照，分类策略调整不影响当轮。
 import { ROLE } from './permission'
 
 // 复核单状态（每轮一条：驳回不是终态，修订后在同一条复核单上重新送审；approved 为本轮已通过）
@@ -11,6 +12,12 @@ export const FRESH = {
   REJECTED: 'rejected', // 已驳回：管理员驳回，继续整改后重新送审（引用仍暂停）
   APPROVED: 'approved', // 已通过：内容确认有效/已修订，恢复引用并重算周期
   CANCELLED: 'cancelled' // 已取消：负责人关闭保鲜，当前复核单作废（记录保留）
+}
+
+// 保鲜配置来源（doc.freshness.source / freshnessTickets.ruleSource）
+export const RULE_SOURCE = {
+  POLICY: 'policy', // 继承分类复核策略（策略调整时随批量重算）
+  DOC: 'doc' // 文档单独设置（覆盖分类策略，不随批量重算）
 }
 
 export const DAY_MS = 24 * 3600 * 1000
@@ -42,6 +49,38 @@ export function calcDueAt(days, from) {
   const n = Number(days)
   if (!n || n <= 0) return null
   return new Date(new Date(from).getTime() + n * DAY_MS).toISOString()
+}
+
+// 文档级覆盖判定：显式继承分类策略（source==='policy'）之外的保鲜配置都视为文档级覆盖；
+// 历史数据无 source 字段（v9 迁移前）按覆盖处理，策略批量重算不会误伤既有逐篇配置
+export function isDocOverride(freshness) {
+  return !!freshness && freshness.source !== RULE_SOURCE.POLICY
+}
+
+// 由分类策略物化一份继承配置（写到 doc.freshness）：保留历史轮次与最近通过记录，
+// 到期点自当前时刻按策略周期重算；prev 为文档既有 freshness（无则全新继承）
+export function materializeFromPolicy(policy, prev, nowIso = new Date().toISOString()) {
+  const base = prev || {}
+  return {
+    ...base,
+    cycleDays: Number(policy.cycleDays),
+    nextDueAt: calcDueAt(policy.cycleDays, nowIso),
+    round: base.round || 0,
+    activeTicket: null,
+    source: RULE_SOURCE.POLICY,
+    policyId: policy.id,
+    updatedAt: nowIso
+  }
+}
+
+// 配置来源文案（继承分类策略 / 文档单独设置；历史数据无 source 视为文档级）
+export function ruleSourceLabel(source) {
+  return source === RULE_SOURCE.POLICY ? '继承分类策略' : '文档单独设置'
+}
+
+// 分类复核策略为平台级治理配置：仅管理员可设置/调整/关闭
+export function canManagePolicy(role) {
+  return role === ROLE.ADMIN
 }
 
 // 文档是否启用了知识保鲜（设置了有效周期）
@@ -111,6 +150,11 @@ export function freshTimelineLabel(action) {
     change: '调整复核周期',
     disable: '关闭知识保鲜',
     cancel: '作废复核单',
+    'reset-policy': '恢复跟随分类策略',
+    'policy-setting': '设置分类复核策略',
+    'policy-change': '调整分类复核策略 · 重算到期计划',
+    'policy-disable': '关闭分类复核策略 · 退出知识保鲜',
+    'policy-convert': '分类策略已关闭 · 按规则快照转为文档级配置',
     handover: '负责人交接 · 保鲜责任转移'
   }[action] || action
 }

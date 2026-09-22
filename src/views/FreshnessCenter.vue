@@ -5,14 +5,17 @@ import { useKbStore } from '@/stores/kb'
 import { useAuthStore } from '@/stores/auth'
 import { useFreshnessStore } from '@/stores/freshness'
 import DocPill from '@/components/common/DocPill.vue'
-import { formatFull, avatarColor } from '@/utils/format'
-import { FRESH, freshStatusLabel, freshStatusCls, dueText, freshTimelineLabel, cycleDaysLabel, isFreshnessEnabled } from '@/utils/freshness'
+import { formatFull, formatDate, avatarColor } from '@/utils/format'
+import {
+  FRESH, FRESH_CYCLES, freshStatusLabel, freshStatusCls, dueText, freshTimelineLabel,
+  cycleDaysLabel, isFreshnessEnabled, isDocOverride, ruleSourceLabel, canManagePolicy
+} from '@/utils/freshness'
 const router = useRouter()
 const kb = useKbStore()
 const auth = useAuthStore()
 const freshness = useFreshnessStore()
 
-const tab = ref('active') // active | mine | all
+const tab = ref('active') // active | mine | all | policies
 
 const docById = computed(() => Object.fromEntries(kb.docs.map((d) => [d.id, d])))
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
@@ -45,6 +48,88 @@ const upcoming = computed(() =>
     .slice(0, 8)
 )
 
+// ---- 分类复核策略 ----
+const isPolicyAdmin = computed(() => canManagePolicy(auth.user?.role))
+// 每个分类的策略表单（chips 选择 + 自定义天数）
+const pForm = ref({})
+const pBusy = ref(false)
+const pToast = ref('')
+
+function formOf(catId) {
+  if (!pForm.value[catId]) {
+    const cur = freshness.policyOfCategory(catId)
+    pForm.value = { ...pForm.value, [catId]: { days: cur?.cycleDays || 90, custom: '' } }
+  }
+  return pForm.value[catId]
+}
+
+function pickDays(catId, days) {
+  pForm.value = { ...pForm.value, [catId]: { ...formOf(catId), days, custom: '' } }
+}
+
+function setCustom(catId, val) {
+  pForm.value = { ...pForm.value, [catId]: { ...formOf(catId), custom: val } }
+}
+
+// 分类下保鲜配置统计：跟随策略 / 文档级覆盖 / 在途复核单
+function catStats(catId) {
+  const docs = kb.docs.filter((d) => d.categoryId === catId)
+  return {
+    total: docs.length,
+    inherit: docs.filter((d) => d.freshness && !isDocOverride(d.freshness)).length,
+    override: docs.filter((d) => isDocOverride(d.freshness)).length,
+    open: docs.filter((d) => freshness.activeTicketOf(d.id)).length
+  }
+}
+
+function toast(msg) {
+  pToast.value = msg
+  setTimeout(() => { pToast.value = '' }, 4000)
+}
+
+async function savePolicy(cat) {
+  if (pBusy.value) return
+  const f = formOf(cat.id)
+  const days = Number(f.custom) > 0 ? Math.floor(Number(f.custom)) : Number(f.days)
+  if (!(days > 0)) { alert('请填写有效的复核周期天数'); return }
+  pBusy.value = true
+  try {
+    const res = await freshness.setCategoryPolicy(cat.id, days, auth.user)
+    if (res.status === 'ok') {
+      const parts = ['已' + (res.action === 'change' ? '调整' : '设置') + '「' + cat.name + '」复核周期为 ' + days + ' 天']
+      parts.push('重算到期 ' + res.applied + ' 篇')
+      if (res.skipped) parts.push(res.skipped + ' 篇在途复核保留规则快照')
+      if (res.kept) parts.push(res.kept + ' 篇文档级覆盖未动')
+      toast('✅ ' + parts.join('，'))
+    } else if (res.status === 'denied' || res.status === 'guest') {
+      alert('仅管理员可以设置分类复核策略。')
+    } else {
+      alert('保存失败，请重试')
+    }
+  } finally {
+    pBusy.value = false
+  }
+}
+
+async function clearPolicy(cat) {
+  if (pBusy.value) return
+  if (!confirm('关闭「' + cat.name + '」的分类复核策略？\n跟随策略且无在途复核的文档将退出保鲜并恢复问答引用；有在途复核单的文档按规则快照转为文档级配置继续本轮。')) return
+  pBusy.value = true
+  try {
+    const res = await freshness.clearCategoryPolicy(cat.id, auth.user)
+    if (res.status === 'ok') {
+      const parts = ['已关闭「' + cat.name + '」分类复核策略']
+      if (res.cleared) parts.push(res.cleared + ' 篇退出保鲜')
+      if (res.converted) parts.push(res.converted + ' 篇在途复核转为文档级配置')
+      toast('✅ ' + parts.join('，'))
+    } else if (res.status === 'denied' || res.status === 'guest') {
+      alert('仅管理员可以关闭分类复核策略。')
+    }
+  } finally {
+    pBusy.value = false
+  }
+}
+
 onMounted(async () => {
   await Promise.all([kb.loadAll(), freshness.loadAll()])
 })
@@ -54,20 +139,72 @@ onMounted(async () => {
   <div class="fc-page">
     <header class="head">
       <h2>🧊 知识保鲜中心</h2>
-      <p class="sub">负责人为文档设置复核周期，到期自动生成复核单并暂停问答引用；编辑者修订送审，管理员批准后恢复引用并重算周期，驳回则继续整改，每轮复核全程留痕。</p>
+      <p class="sub">管理员可按分类批量设置复核策略，文档可单独覆盖；策略调整自动重算到期计划，在途复核单保留规则快照。到期自动生成复核单并暂停问答引用，批准后恢复引用并重算周期。</p>
       <div class="tabs">
         <button :class="{ on: tab === 'active' }" @click="tab = 'active'">待处理 <em>{{ counts.active }}</em></button>
         <button :class="{ on: tab === 'mine' }" @click="tab = 'mine'">我负责的 <em>{{ counts.mine }}</em></button>
         <button :class="{ on: tab === 'all' }" @click="tab = 'all'">全部复核记录 <em>{{ counts.all }}</em></button>
+        <button :class="{ on: tab === 'policies' }" @click="tab = 'policies'">分类策略 <em>{{ freshness.policies.length }}</em></button>
       </div>
     </header>
 
+    <!-- 分类复核策略：批量设置，文档可单独覆盖 -->
+    <div v-if="tab === 'policies'" class="policies">
+      <div v-if="pToast" class="p-toast card">{{ pToast }}</div>
+      <div class="p-tip card">
+        分类策略对该分类下「未单独设置」的文档统一生效；文档级单独设置优先于分类策略。调整策略会立即重算跟随文档的到期计划，在途复核单仍按生成时的规则快照执行。
+      </div>
+      <div v-for="cat in kb.categories" :key="cat.id" class="policy card">
+        <div class="p-head">
+          <span class="p-name">{{ cat.name }}</span>
+          <template v-if="freshness.policyOfCategory(cat.id)">
+            <span class="st st-ok">❄ {{ cycleDaysLabel(freshness.policyOfCategory(cat.id).cycleDays) }}复核</span>
+            <span class="dim">
+              {{ userById[freshness.policyOfCategory(cat.id).updatedBy]?.name || freshness.policyOfCategory(cat.id).updatedBy }}
+              更新于 {{ formatDate(freshness.policyOfCategory(cat.id).updatedAt) }}
+            </span>
+          </template>
+          <span v-else class="st st-off">未设置策略</span>
+          <span class="p-stats dim">
+            {{ catStats(cat.id).total }} 篇文档 · {{ catStats(cat.id).inherit }} 篇跟随策略 · {{ catStats(cat.id).override }} 篇单独设置<template v-if="catStats(cat.id).open"> · {{ catStats(cat.id).open }} 篇在途复核</template>
+          </span>
+        </div>
+        <div v-if="isPolicyAdmin" class="p-form">
+          <div class="chips">
+            <span
+              v-for="c in FRESH_CYCLES" :key="c.days" class="chip"
+              :class="{ on: !formOf(cat.id).custom && Number(formOf(cat.id).days) === c.days }"
+              @click="pickDays(cat.id, c.days)"
+            >{{ c.label }}</span>
+          </div>
+          <input
+            :value="formOf(cat.id).custom" class="custom" type="number" min="1" placeholder="自定义天数"
+            @input="setCustom(cat.id, $event.target.value)"
+          />
+          <button class="btn sm primary" :disabled="pBusy" @click="savePolicy(cat)">
+            {{ freshness.policyOfCategory(cat.id) ? '保存策略并重算' : '开启分类策略' }}
+          </button>
+          <button v-if="freshness.policyOfCategory(cat.id)" class="btn sm ghost" :disabled="pBusy" @click="clearPolicy(cat)">关闭策略</button>
+        </div>
+        <details v-if="freshness.policyOfCategory(cat.id)?.timeline?.length" class="p-timeline">
+          <summary>策略留痕（{{ freshness.policyOfCategory(cat.id).timeline.length }}）</summary>
+          <div v-for="(x, i) in freshness.policyOfCategory(cat.id).timeline" :key="i" class="tl">
+            <span class="tl-act">{{ freshTimelineLabel(x.action) }}</span>
+            <span class="tl-who">{{ userById[x.by]?.name || x.by }}</span>
+            <span v-if="x.note" class="tl-note">“{{ x.note }}”</span>
+            <span class="tl-tm">{{ formatFull(x.at) }}</span>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <template v-else>
     <div v-if="tab === 'active' && upcoming.length" class="upcoming card">
       <div class="up-title">⏳ 临近复核（保鲜运行中）</div>
       <div class="up-list">
         <span v-for="d in upcoming" :key="d.id" class="up-item" @click="router.push('/docs/' + d.id)">
           <span class="up-name">{{ d.title }}</span>
-          <span class="up-due">{{ cycleDaysLabel(d.freshness.cycleDays) }} · {{ dueText(d, null, freshness.now) }}</span>
+          <span class="up-due">{{ cycleDaysLabel(d.freshness.cycleDays) }} · {{ ruleSourceLabel(d.freshness.source) }} · {{ dueText(d, null, freshness.now) }}</span>
         </span>
       </div>
     </div>
@@ -95,7 +232,7 @@ onMounted(async () => {
             <span class="ava" :style="{ background: avatarColor(docById[t.docId]?.ownerId || '?') }">{{ (userById[docById[t.docId]?.ownerId]?.avatar || '?') }}</span>
             负责人：{{ userById[docById[t.docId]?.ownerId]?.name || docById[t.docId]?.ownerId || '—' }}
           </span>
-          <span class="dim">周期 {{ cycleDaysLabel(t.cycleDays) }}</span>
+          <span class="dim">周期 {{ cycleDaysLabel(t.cycleDays) }} · {{ ruleSourceLabel(t.ruleSource) }}</span>
           <span v-if="t.submittedBy" class="dim">
             {{ userById[t.submittedBy]?.name || t.submittedBy }} 送审
           </span>
@@ -117,6 +254,7 @@ onMounted(async () => {
         </details>
       </div>
     </div>
+    </template>
   </div>
 </template>
 
@@ -160,4 +298,18 @@ onMounted(async () => {
 .tl-who { color: var(--text-2); min-width: 50px; }
 .tl-note { color: var(--text-2); flex: 1; }
 .tl-tm { color: var(--text-3); }
+.policies { margin-top: 16px; display: flex; flex-direction: column; gap: 12px; }
+.p-toast { padding: 12px 18px; color: #15803d; font-size: 13px; }
+.p-tip { padding: 12px 18px; font-size: 12.5px; color: var(--text-2); background: #eef2ff; border-color: #c7d2fe; }
+.policy { padding: 16px 20px; }
+.p-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.p-name { font-weight: 700; font-size: 14px; }
+.p-stats { margin-left: auto; }
+.p-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { padding: 4px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-2); cursor: pointer; font-size: 13px; }
+.chip.on { background: #0e7490; border-color: #0e7490; color: #fff; }
+.custom { width: 110px; padding: 5px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; }
+.p-timeline { margin-top: 10px; }
+.p-timeline summary { cursor: pointer; font-size: 12px; color: var(--text-3); }
 </style>

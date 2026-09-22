@@ -10,7 +10,8 @@ import { GUEST_ID } from '@/utils/permission'
 import { canReviewDecision, canSubmitReview } from '@/utils/review'
 import {
   FRESH, FRESH_CYCLES, cycleDaysLabel, freshStatusLabel, freshStatusCls,
-  canManageFreshness, dueText, freshTimelineLabel, isFreshnessEnabled
+  canManageFreshness, dueText, freshTimelineLabel, isFreshnessEnabled,
+  isDocOverride, ruleSourceLabel
 } from '@/utils/freshness'
 
 const props = defineProps({
@@ -41,6 +42,9 @@ const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, 
 const isManager = computed(() => canManageFreshness(props.doc, auth.user?.id, auth.user?.role))
 const activeGrant = computed(() => accessStore.grantOf(props.doc.id, auth.user?.id))
 const pendingReview = computed(() => reviewStore.pendingReviewOf(props.doc.id))
+// 本文档分类的复核策略（存在时文档可选择跟随或单独覆盖）
+const catPolicy = computed(() => freshness.policyOfCategory(props.doc.categoryId))
+const inherited = computed(() => isFreshnessEnabled(props.doc) && !isDocOverride(props.doc.freshness))
 
 // 编辑者修订/确认送审资格：与发起评审一致（拥有者/协作成员/管理员，限时协作授权的只读成员不走此通道）
 const canSubmitFresh = computed(() => {
@@ -69,7 +73,7 @@ async function saveCycle() {
   try {
     const res = await freshness.setFreshCycle(props.doc.id, days, auth.user)
     if (res.status === 'ok') {
-      justSaved.value = '已' + (res.action === 'change' ? '调整复核周期为 ' + days + ' 天' : '开启知识保鲜，复核周期 ' + days + ' 天')
+      justSaved.value = '已' + (res.action === 'change' ? '调整复核周期为 ' + days + ' 天' : '开启知识保鲜，复核周期 ' + days + ' 天') + '（文档单独设置）'
       customDays.value = ''
       setTimeout(() => { justSaved.value = '' }, 3000)
     } else if (res.status === 'has-open') {
@@ -78,6 +82,28 @@ async function saveCycle() {
       alert('仅文档拥有者或管理员可以设置复核周期。')
     } else {
       alert('保存失败，请重试')
+    }
+  } finally {
+    busy.value = false
+  }
+}
+
+// 取消文档级覆盖，恢复跟随分类策略
+async function resetToPolicyAction() {
+  if (busy.value || !catPolicy.value) return
+  if (!confirm('恢复跟随分类策略？本文档将按分类统一周期（' + catPolicy.value.cycleDays + ' 天）重算到期点，文档级单独设置将被移除。')) return
+  busy.value = true
+  try {
+    const res = await freshness.resetToPolicy(props.doc.id, auth.user)
+    if (res.status === 'ok') {
+      justSaved.value = '已恢复跟随分类策略（' + catPolicy.value.cycleDays + ' 天）'
+      setTimeout(() => { justSaved.value = '' }, 3000)
+    } else if (res.status === 'has-open') {
+      alert('当前存在流转中的复核单，请先完成本轮复核。')
+    } else if (res.status === 'no-policy') {
+      alert('本文档所在分类暂无复核策略。')
+    } else if (res.status === 'denied' || res.status === 'guest') {
+      alert('仅文档拥有者或管理员可以调整保鲜配置。')
     }
   } finally {
     busy.value = false
@@ -176,6 +202,9 @@ function statusCls(s) { return freshStatusCls(s) }
         ❄ {{ cycleDaysLabel(doc.freshness.cycleDays) }}复核 · {{ dueText(doc, null, freshness.now) }}
       </span>
       <span v-else class="st st-off">未启用</span>
+      <span v-if="isFreshnessEnabled(doc)" class="st" :class="inherited ? 'st-policy' : 'st-doc'">
+        {{ ruleSourceLabel(doc.freshness.source) }}
+      </span>
     </div>
 
     <div v-if="justSaved" class="toast-line">✅ {{ justSaved }}</div>
@@ -186,6 +215,7 @@ function statusCls(s) { return freshStatusCls(s) }
         <div class="t-meta">
           <span>第 <b>{{ ticket.round }}</b> 轮复核</span>
           <span class="dim">到期点：{{ formatFull(ticket.dueAt) }}（{{ dueText(doc, ticket, freshness.now) }}）</span>
+          <span class="dim">本轮规则快照：{{ cycleDaysLabel(ticket.cycleDays) }} · {{ ruleSourceLabel(ticket.ruleSource) }}</span>
         </div>
         <div class="pause-note">⏸ 问答引用已暂停：本文档已超过复核周期，复核通过后自动恢复引用并重算周期。</div>
 
@@ -230,6 +260,9 @@ function statusCls(s) { return freshStatusCls(s) }
     <!-- 周期配置（负责人/管理员） -->
     <div v-if="isManager" class="config">
       <template v-if="!ticket">
+        <div v-if="inherited && catPolicy" class="src-note">
+          当前跟随分类策略（{{ cycleDaysLabel(catPolicy.cycleDays) }}），策略调整会自动重算本文档到期点；在下方保存周期将转为本文档单独设置。
+        </div>
         <div class="cfg-line">
           <label>复核周期</label>
           <div class="chips">
@@ -238,7 +271,8 @@ function statusCls(s) { return freshStatusCls(s) }
           <input v-model="customDays" class="custom" type="number" min="1" placeholder="自定义天数" />
         </div>
         <div class="cfg-acts">
-          <button class="btn sm primary" :disabled="busy" @click="saveCycle">{{ isFreshnessEnabled(doc) ? '保存周期' : '开启知识保鲜' }}</button>
+          <button class="btn sm primary" :disabled="busy" @click="saveCycle">{{ isFreshnessEnabled(doc) ? (inherited ? '转为单独设置' : '保存周期') : '开启知识保鲜' }}</button>
+          <button v-if="isDocOverride(doc.freshness) && catPolicy" class="btn sm" :disabled="busy" @click="resetToPolicyAction">↩ 恢复跟随分类策略（{{ cycleDaysLabel(catPolicy.cycleDays) }}）</button>
           <button v-if="isFreshnessEnabled(doc)" class="btn sm ghost" :disabled="busy" @click="disableFreshnessAction">关闭保鲜</button>
         </div>
         <p v-if="isFreshnessEnabled(doc) && doc.freshness?.lastApprovedAt" class="dim last">
@@ -246,7 +280,7 @@ function statusCls(s) { return freshStatusCls(s) }
         </p>
       </template>
       <div v-else class="cfg-locked dim">
-        本轮复核完成后可调整/关闭复核周期。当前周期：{{ cycleDaysLabel(ticket.cycleDays) }}。
+        本轮复核完成后可调整/关闭复核周期。当前周期：{{ cycleDaysLabel(ticket.cycleDays) }}（{{ ruleSourceLabel(ticket.ruleSource) }} · 规则快照）。
       </div>
     </div>
     <p v-else-if="!isFreshnessEnabled(doc)" class="dim no-perm">该文档未启用知识保鲜，仅拥有者或管理员可设置复核周期。</p>
@@ -284,6 +318,9 @@ function statusCls(s) { return freshStatusCls(s) }
 .st-no { background: #fee2e2; color: #b91c1c; }
 .st-ok { background: #dcfce7; color: #15803d; }
 .st-off { background: var(--panel-2); color: var(--text-3); }
+.st-policy { background: #e0e7ff; color: #4338ca; }
+.st-doc { background: var(--panel-2); color: var(--text-2); }
+.src-note { font-size: 12px; color: #4338ca; background: #eef2ff; border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; }
 .toast-line { color: #15803d; font-size: 13px; margin-bottom: 10px; }
 .ticket { border: 1px solid #a5f3fc; background: #ecfeff; border-radius: 10px; padding: 12px 14px; }
 .t-meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; margin-bottom: 6px; }

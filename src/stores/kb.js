@@ -7,6 +7,7 @@ import { buildTimelineEntry } from '@/utils/review'
 import { GAP } from '@/utils/gap'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
 import { canEditContent, canEditDoc, canDeleteDoc, GUEST_ID } from '@/utils/permission'
+import { isDocOverride, isFreshTicketOpen, materializeFromPolicy } from '@/utils/freshness'
 import { useAuthStore } from './auth'
 import { useGapStore } from './gap'
 
@@ -68,6 +69,9 @@ export const useKbStore = defineStore('kb', () => {
       updatedAt: now,
       versions: [{ version: 1, savedAt: now, savedBy: currentUser?.id || 'u-guest', note: '创建文档', snapshot: docSnapshot(payload) }]
     }
+    // 分类设有复核策略时新文档自动继承（物化为 source='policy'，后续随策略批量重算）
+    const policy = doc.categoryId ? await db.freshnessPolicies.where('categoryId').equals(doc.categoryId).first() : null
+    if (policy) doc.freshness = materializeFromPolicy(policy, null, now)
     await db.docs.add(doc)
     await reloadDocs()
     return doc
@@ -88,7 +92,7 @@ export const useKbStore = defineStore('kb', () => {
     const isGuest = savedBy === GUEST_ID
     let result = null
     // 读 + 写放在同一事务中，保证「权限/版本检测 → 合并 → 追加版本记录」不被其他窗口的写入打断
-    await db.transaction('rw', db.docs, db.accessRequests, db.shares, db.reviews, async () => {
+    await db.transaction('rw', db.docs, db.accessRequests, db.shares, db.reviews, db.freshnessTickets, db.freshnessPolicies, async () => {
       const existing = await db.docs.get(id)
       if (!existing) { result = { status: 'missing' }; return }
       // 事务内重读评审状态：评审中锁定仅管理员可直接写（管理员并发修改通道），
@@ -151,6 +155,18 @@ export const useKbStore = defineStore('kb', () => {
           fields = merge.fields
           // 用户选择以本次提交为准：冲突字段强制采用我方值，其余字段仍是合并结果
           if (opts.force) for (const k of merge.conflicts) fields[k] = patch[k]
+        }
+      }
+
+      // 分类变更：无文档级覆盖的文档按新分类策略重解析保鲜配置（新分类无策略则退出保鲜）；
+      // 有在途复核单时跳过——当轮按规则快照执行，结案时由保鲜联动按新分类策略重算
+      if (fields.categoryId && fields.categoryId !== existing.categoryId && !isDocOverride(existing.freshness)) {
+        const openFresh = await db.freshnessTickets
+          .where('docId').equals(id)
+          .filter((t) => isFreshTicketOpen(t)).first()
+        if (!openFresh) {
+          const pol = await db.freshnessPolicies.where('categoryId').equals(fields.categoryId).first()
+          fields = { ...fields, freshness: pol ? materializeFromPolicy(pol, existing.freshness, now) : null }
         }
       }
 

@@ -60,13 +60,39 @@ export class KnowledgeDB extends Dexie {
     })
     // v8：知识退役替代
     // - retirements：负责人发起文档退役并指定替代文档（pending 待管理员审批 → approved 生效 /
-    //   rejected 驳回 / cancelled 发起人撤销 / revoked 退役撤销）；批准后同事务停止旧文档的搜索与
+    //   rejected 驳回 / cancelled 发起人撤销 / revoked 退役撤销）；批准后同事务停止旧文档的
     //   问答引用、撤销其共享链接（记录保留）、把已解决缺口工单的答案来源改挂替代文档；
     //   退役可撤销并全程保留记录。doc.retirement（当前生效退役）随记录读写，不单独建索引。
     this.version(8).stores({
       retirements: 'id, status, docId, replacementDocId, initiatedBy, decidedBy, createdAt, decidedAt'
     })
+    // v9：分类复核策略
+    // - freshnessPolicies：按分类批量设置复核周期（每分类一条），无文档级覆盖的文档继承策略并
+    //   物化到 doc.freshness（source='policy'）；策略调整时重算无在途复核单文档的到期计划，
+    //   在途复核单保留规则快照（ruleSource/policyId/cycleDays），结案时按当时策略重算下一周期。
+    //   doc.freshness.source / freshnessTickets.ruleSource 随记录读写，不单独建索引。
+    this.version(9).stores({
+      freshnessPolicies: 'id, categoryId, updatedAt'
+    }).upgrade(migrateFreshnessPolicyV9)
   }
+}
+
+// v9 数据迁移（导出供升级与回归测试共用）：
+// 已有逐篇保鲜配置标记为文档级覆盖（source='doc'），历史/在途复核单补规则来源快照，
+// 升级前后语义一致——策略批量重算只认显式 source='policy' 的继承配置，不会误伤既有逐篇配置
+export async function migrateFreshnessPolicyV9(tx) {
+  await tx.table('docs').toCollection().modify((d) => {
+    if (d.freshness && d.freshness.source !== 'policy' && d.freshness.source !== 'doc') {
+      d.freshness.source = 'doc'
+      d.freshness.policyId = null
+    }
+  })
+  await tx.table('freshnessTickets').toCollection().modify((t) => {
+    if (t.ruleSource !== 'policy' && t.ruleSource !== 'doc') {
+      t.ruleSource = 'doc'
+      t.policyId = null
+    }
+  })
 }
 
 export const db = new KnowledgeDB('knowbase')

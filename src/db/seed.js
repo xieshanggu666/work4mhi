@@ -371,8 +371,9 @@ const seedReview5 = {
 // v3 文档访问申请演示数据（doc-9 保密文档上的限时阅读/协作授权、撤销与到期留痕）；
 // v4 版本快照回填与 doc-2 恢复演示（v2 误删 + rev-5 恢复评审通过 + v3 恢复边界标记）；
 // v5 知识保鲜演示（doc-8 逾期整改中 / doc-1 修订送审中 / doc-5 复核通过 / doc-6 保鲜运行中）；
-// v6 责任交接演示（ho-1 待确认 / ho-2 已完成含历史归属 / ho-3 并发变更失败回退）
-const SEED_VER = '6'
+// v6 责任交接演示（ho-1 待确认 / ho-2 已完成含历史归属 / ho-3 并发变更失败回退）；
+// v7 分类复核策略演示（fp-1 产品设计分类 180 天：doc-9 继承策略，doc-4 文档级覆盖 + 在途复核单保留快照）
+const SEED_VER = '7'
 
 async function isSeeded() {
   return (await getMeta('seeded')) === SEED_VER
@@ -571,7 +572,7 @@ const seedFreshReviews = [
 const seedFreshTickets = [
   {
     id: 'fr-1', docId: 'doc-8', round: 1, status: 'rejected',
-    cycleDays: 30, dueAt: ago(2 * d),
+    cycleDays: 30, ruleSource: 'doc', policyId: null, dueAt: ago(2 * d),
     reviewId: null, submittedBy: 'u-chen', submittedAt: ago(1 * d + 4 * h),
     decidedBy: 'u-admin', decidedAt: ago(1 * d),
     decisionNote: '强制改密周期需与运维确认后再修订，请补充具体策略。',
@@ -584,7 +585,7 @@ const seedFreshTickets = [
   },
   {
     id: 'fr-2', docId: 'doc-4', round: 1, status: 'submitted',
-    cycleDays: 180, dueAt: ago(1 * d),
+    cycleDays: 180, ruleSource: 'doc', policyId: null, dueAt: ago(1 * d),
     reviewId: 'rev-6', submittedBy: 'u-ziwei', submittedAt: ago(3 * h),
     decidedBy: null, decidedAt: null, decisionNote: '',
     createdAt: ago(1 * d),
@@ -595,7 +596,7 @@ const seedFreshTickets = [
   },
   {
     id: 'fr-3', docId: 'doc-5', round: 1, status: 'approved',
-    cycleDays: 365, dueAt: ago(10 * d),
+    cycleDays: 365, ruleSource: 'doc', policyId: null, dueAt: ago(10 * d),
     reviewId: 'rev-7', submittedBy: 'u-admin', submittedAt: ago(10 * d),
     decidedBy: 'u-admin', decidedAt: ago(10 * d),
     decisionNote: '入职流程本季度无变化，确认继续有效。',
@@ -618,7 +619,7 @@ async function ensureFreshnessSeed() {
   // doc-8：30 天周期逾期整改中（问答引用暂停），沿用 rev-3 的驳回结论与 v1 版本
   const doc8 = await db.docs.get('doc-8')
   if (doc8 && !doc8.freshness) {
-    await db.docs.update('doc-8', { freshness: { cycleDays: 30, nextDueAt: ago(2 * d), round: 1, activeTicket: 'fr-1' } })
+    await db.docs.update('doc-8', { freshness: { cycleDays: 30, nextDueAt: ago(2 * d), round: 1, activeTicket: 'fr-1', source: 'doc', policyId: null } })
   }
   // doc-4：保鲜复核送审中，文档锁定，正文仍为旧版（rev-6 快照通过后才回写）
   const doc4 = await db.docs.get('doc-4')
@@ -626,7 +627,7 @@ async function ensureFreshnessSeed() {
     await db.docs.update('doc-4', {
       publishState: 'in_review',
       activeReviewId: 'rev-6',
-      freshness: { cycleDays: 180, nextDueAt: ago(1 * d), round: 1, activeTicket: 'fr-2' }
+      freshness: { cycleDays: 180, nextDueAt: ago(1 * d), round: 1, activeTicket: 'fr-2', source: 'doc', policyId: null }
     })
   }
   // doc-5：上一轮「确认有效」复核通过，noChange 不产生新版本，周期重算至约 355 天后
@@ -638,6 +639,7 @@ async function ensureFreshnessSeed() {
       lastReview: { reviewId: 'rev-7', status: 'approved', by: 'u-admin', at: approvedAt, note: '入职流程本季度无变化，确认继续有效。' },
       freshness: {
         cycleDays: 365, nextDueAt: ago(-355 * d), round: 1, activeTicket: null,
+        source: 'doc', policyId: null,
         lastApprovedAt: approvedAt, lastApprovedBy: 'u-admin', lastReviewId: 'rev-7'
       }
     })
@@ -645,7 +647,7 @@ async function ensureFreshnessSeed() {
   // doc-6：90 天周期保鲜运行中，约 6 小时后到期（不到点，不生成复核单、不影响引用）
   const doc6 = await db.docs.get('doc-6')
   if (doc6 && !doc6.freshness) {
-    await db.docs.update('doc-6', { freshness: { cycleDays: 90, nextDueAt: ago(-6 * h), round: 0, activeTicket: null } })
+    await db.docs.update('doc-6', { freshness: { cycleDays: 90, nextDueAt: ago(-6 * h), round: 0, activeTicket: null, source: 'doc', policyId: null } })
   }
 }
 
@@ -747,9 +749,33 @@ async function ensureHandoverSeed() {
   await db.handovers.bulkAdd(handovers)
 }
 
+// ---- 分类复核策略演示（v7 增量种子）----
+// fp-1「产品设计」分类统一 180 天复核：
+// - doc-9（保密薪酬方案）无单独配置 → 继承策略，批量纳入保鲜（约 180 天后到期）；
+// - doc-4 有文档级 180 天配置且复核送审中 → 保留文档级覆盖与在途复核单规则快照，不受策略影响。
+// 老库升级时补充；已有逐篇配置由 Dexie v9 迁移标记为文档级覆盖（source='doc'），此处不再改写。
+async function ensurePolicySeed() {
+  if ((await db.freshnessPolicies.count()) > 0) return
+  const nowIso = new Date().toISOString()
+  await db.freshnessPolicies.add({
+    id: 'fp-1', categoryId: 'c-product', cycleDays: 180,
+    createdBy: 'u-admin', updatedBy: 'u-admin', createdAt: nowIso, updatedAt: nowIso,
+    timeline: [{ action: 'policy-setting', by: 'u-admin', at: nowIso, note: '产品设计分类统一按 180 天周期复核，文档可单独覆盖' }]
+  })
+  const doc9 = await db.docs.get('doc-9')
+  if (doc9 && !doc9.freshness) {
+    await db.docs.update('doc-9', {
+      freshness: {
+        cycleDays: 180, nextDueAt: ago(-180 * d), round: 0, activeTicket: null,
+        source: 'policy', policyId: 'fp-1', updatedAt: nowIso
+      }
+    })
+  }
+}
+
 export async function ensureSeeded() {
   if (await isSeeded()) return
-  await db.transaction('rw', db.users, db.categories, db.tags, db.docs, db.comments, db.shares, db.favorites, db.ratings, db.reviews, db.gapTickets, db.accessRequests, db.freshnessTickets, db.handovers, async () => {
+  await db.transaction('rw', db.users, db.categories, db.tags, db.docs, db.comments, db.shares, db.favorites, db.ratings, db.reviews, db.gapTickets, db.accessRequests, db.freshnessTickets, db.handovers, db.freshnessPolicies, async () => {
     if ((await db.users.count()) === 0) {
       await db.users.bulkAdd(seedUsers)
       await db.categories.bulkAdd(seedCategories)
@@ -766,6 +792,7 @@ export async function ensureSeeded() {
     await ensureRestoreSeed()
     await ensureFreshnessSeed()
     await ensureHandoverSeed()
+    await ensurePolicySeed()
   })
   await setMeta('seeded', SEED_VER)
 }
